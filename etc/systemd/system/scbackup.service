@@ -1,0 +1,8 @@
+[Unit]
+Description=Run the scbackup client
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/scbclient
+IOSchedulingClass=2
+IOSchedulingPriority=7

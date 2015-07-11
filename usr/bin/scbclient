@@ -1,0 +1,389 @@
+#!/bin/bash
+
+#
+# /usr/bin/scbclient
+#
+
+# Source the config file
+source /etc/scbackup/client.conf
+
+
+# DO NOT CHANGE
+SCB_LOG_FILE="/tmp/scbclient-$(date -I).log"
+SCB_RSYNC_LOG_FILE="/tmp/scbclient_rsync-$(date -I).log"
+SCB_SSH_CMD="${SCB_SSH} -i ${SCB_KEY} -p ${SCB_PORT}"
+SCB_ROOT_DIR="/root/scbackup/$(date -I)"
+SCB_USER_DEST=$(echo "${SCB_USER}" | cut -d '-' -f2)
+
+scb_log()
+{
+    if [[ ! -f ${SCB_LOG_FILE} ]]; then
+        echo "-------------------- SCBCLIENT LOG START AT $(date) --------------------" > ${SCB_LOG_FILE}
+    fi
+
+    echo "$(date '+%Y-%m-%d %T'): ${@}"
+    echo "$(date '+%Y-%m-%d %T'): ${@}" >> ${SCB_LOG_FILE}
+    logger ${@}
+}
+
+scb_check_remote()
+{
+    scb_log "Checking remote."
+
+    $(${SCB_SSH_CMD} ${SCB_USER}@${SCB_SERVER} '/usr/bin/scbserver checkdirs' >> ${SCB_LOG_FILE} 2>&1)
+
+    return ${?}
+}
+
+scb_backup_boot()
+{
+    if [[ "mbr" == ${SCB_BOOT_TYPE} ]]; then
+        scb_log "Backing up the MBR."
+        dd if=${SCB_BOOT_DEV} of=${SCB_ROOT_DIR}/BACKUP.MBR bs=512 count=1 >> ${SCB_LOG_FILE} 2>&1
+
+    elif [[ "gpt" == ${SCB_BOOT_TYPE} ]]; then
+        scb_log "Backing up the GUID partition table."
+        sgdis -b ${SCB_ROOT_DIR}/BACKUP.GPT ${SCB_BOOT_DEV} >> ${SCB_LOG_FILE} 2>&1
+    fi
+}
+
+scb_backup_luks()
+{
+    for DEV in ${SCB_LUKS_DEVS}; do
+        scb_log "Backing up LUKS header of ${DEV}."
+        local _FILENAME=$(echo "${DEV}" | tr '/' '_')
+        cryptsetup luksHeaderBackup ${DEV} --header-backup-file ${SCB_ROOT_DIR}/${_FILENAME}.luksHeader.img >> ${SCB_LOG_FILE} 2>&1
+    done
+}
+
+scb_snapshot_create()
+{
+    scb_log "Creating LVM snapshot ${SCB_SNAPSHOT_NAME}."
+
+    if [[ "y" == ${SCB_BACKUP_MYSQL} ]]; then
+        # In case we want to back up a MySQL/MariaDB database, we have to lock the tables before creating the snapshot
+        local _TMP=/tmp/sqlbackup.$$.sql
+
+        ${SCB_CAT} > ${_tmp} <<EOF
+FLUSH TABLES WITH READ LOCK;
+\! ${SCB_LVCREATE} -l 100%FREE -s -n ${SCB_SNAPSHOT_NAME} ${SCB_SNAPSHOT_VOL_GROUP}/${SCB_SNAPSHOT_DEV} >>${SCB_LOG_FILE} 2>&1
+UNLOCK TABLES;
+EOF
+
+        ${SCB_MYSQL} -u root -p${SCB_MYSQL_PASS} < ${_TMP}
+
+        rm ${_TMP}
+
+    else
+        ${SCB_LVCREATE} -l 100%FREE -s -n ${SCB_SNAPSHOT_NAME} ${SCB_SNAPSHOT_VOL_GROUP}/${SCB_SNAPSHOT_DEV} >> ${SCB_LOG_FILE} 2>&1
+
+    fi
+
+}
+
+scb_snapshot_mount()
+{
+    scb_log "Mounting LVM snapshot ${SCB_SNAPSHOT_NAME} to ${SCB_SNAPSHOT_MOUNT_DEST}"
+
+    mkdir -p ${SCB_SNAPSHOT_MOUNT_DEST}
+    ${SCB_MOUNT} ${SCB_SNAPSHOT_VOL_GROUP}/${SCB_SNAPSHOT_NAME} ${SCB_SNAPSHOT_MOUNT_DEST} >> ${SCB_LOG_FILE} 2>&1
+}
+
+scb_snapshot_remove()
+{
+    scb_log "Removing LVM snapshot ${SCB_SNAPSHOT_NAME}."
+
+    ${SCB_UMOUNT} ${SCB_SNAPSHOT_MOUNT_DEST} >> ${SCB_LOG_FILE} 2>&1
+    ${SCB_LVREMOVE} -f ${SCB_SNAPSHOT_VOL_GROUP}/${SCB_SNAPSHOT_NAME} >> ${SCB_LOG_FILE} 2>&1
+    rmdir ${SCB_SNAPSHOT_MOUNT_DEST}
+}
+
+scb_compress_monthly()
+{
+    if [[ "y" == ${SCB_DELETE_AFTER_COMPRESSION} ]]; then
+        scb_log "Starting compression of monthly backup. Deleting source directory afterwards."
+        $(${SCB_SSH_CMD} ${SCB_USER}@${SCB_SERVER} '/usr/bin/scbserver compress y' >> ${SCB_LOG_FILE} 2>&1)
+
+    else
+        scb_log "Starting compression of monthly backup."
+        $(${SCB_SSH_CMD} ${SCB_USER}@${SCB_SERVER} '/usr/bin/scbserver compress n' >> ${SCB_LOG_FILE} 2>&1)
+
+    fi
+}
+
+scb_backup_monthly()
+{
+    scb_log "Starting monthly backup."
+
+    mkdir -p ${SCB_ROOT_DIR}
+
+    if [[ "y" == ${SCB_BACKUP_BOOT} ]]; then
+        scb_backup_boot
+    fi
+
+    if [[ "y" == ${SCB_BACKUP_LUKS} ]]; then
+        scb_backup_luks
+    fi
+
+    pacman -Qqne > ${SCB_ROOT_DIR}/packages.list
+
+    if [[ "y" == ${SCB_SNAPSHOT} ]]; then
+        scb_snapshot_create
+        scb_snapshot_mount
+
+        scb_log "Starting rsync."
+
+        ${SCB_RSYNC} -aAxvz --numeric-ids --exclude={"${SCB_SNAPSHOT_MOUNT_SRC}","/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/mnt/*","/media/*","lost+found"} -e "${SCB_SSH_CMD}" /* ${SCB_USER}@${SCB_SERVER}:${SCB_DEST}/${SCB_USER_DEST}/monthly.$(date -I) > ${SCB_RSYNC_LOG_FILE} 2>&1
+
+        scb_snapshot_remove
+
+    else
+        scb_log "Starting rsync."
+
+        ${SCB_RSYNC} -aAxvz --numeric-ids --exclude={"/dev/*","/proc/*","/sys/*","/tmp/*","/run/*","/mnt/*","/media/*","lost+found"} -e "${SCB_SSH_CMD}" /* ${SCB_USER}@${SCB_SERVER}:${SCB_DEST}/${SCB_USER_DEST}/monthly.$(date -I) > ${SCB_RSYNC_LOG_FILE} 2>&1
+
+    fi
+}
+
+scb_backup_weekly()
+{
+    scb_log "Starting weekly backup."
+
+    if [[ "y" == ${SCB_SNAPSHOT} ]]; then
+        scb_snapshot_create
+        scb_snapshot_mount
+    fi
+
+    for DIR in ${SCB_BACKUP_DIRS}; do
+        scb_log "Starting rsync for directory ${DIR}."
+
+        ${SCB_RSYNC} -aAXvz --numeric-ids -e "${SCB_SSH_CMD}" ${DIR} ${SCB_USER}@${SCB_DEST}/${SCB_USER_DEST}/weekly.$(date -I) >> ${SCB_RSYNC_LOG_FILE}
+    done
+
+    if [[ "y" == ${SCB_SNAPSHOT} ]]; then
+        scb_snapshot_remove
+    fi
+}
+
+scb_backup_daily()
+{
+    scb_log "Starting daily backup."
+
+    if [[ "y" == ${SCB_SNAPSHOT} ]]; then
+        scb_snapshot_create
+        scb_snapshot_mount
+    fi
+
+    local _YESTERDAY=$(date -d "yesterday 13:00 " '+%Y-%m-%d')
+    local _YESTERDAY_BACKUP=${1}
+
+    local _DIR_YESTERDAY=${SCB_DEST}/${SCB_USER_DEST}/${_YESTERDAY_BACKUP}.${_YESTERDAY}
+
+    for DIR in ${SCB_BACKUP_DIRS}; do
+        scb_log "Starting rsync for directory ${DIR}."
+
+        ${SCB_RSYNC} -aAXvz --delete --numeric-ids -e "${SCB_SSH_CMD}" --link-dest=${_DIR_YESTERDAY} ${DIR} ${SCB_USER}@${SCB_DEST}/${SCB_USER_DEST}/daily.$(date -I) >> ${SCB_RSYNC_LOG_FILE}
+    done
+
+    if [[ "y" == ${SCB_SNAPSHOT} ]]; then
+        scb_snapshot_remove
+    fi
+}
+
+scb_mail()
+{
+    scb_log "Sending report mail to ${SCB_MAIL_RECIPIENT}."
+
+    if command -v ${SCB_MUTT} > /dev/null 2>&1; then
+        tar cfJ ${SCB_RSYNC_LOG_FILE}.tar.xz ${SCB_RSYNC_LOG_FILE} > /dev/null 2>&1
+        ${SCB_CAT} ${SCB_LOG_FILE} | EMAIL=scbackup@$(hostname -f) ${SCB_MUTT} -s "scbackup report from ${1} backup" -a ${SCB_RSYNC_LOG_FILE}.tar.xz -- ${SCB_MAIL_RECIPIENT}
+        rm ${SCB_RSYNC_LOG_FILE}.tar.xz
+    else
+        mail -s "scbackup report from ${1} backup" ${SCB_MAIL_RECIPIENT} < ${SCB_LOG_FILE}
+    fi
+}
+
+scb_check_user()
+{
+    if [[ $EUID -ne 0 ]]; then
+        scb_log "scbclient must be run as root"
+        exit 1
+    fi
+
+    if [[ "backup" != $(echo "${SCB_USER}" | cut -d '-' -f1) ]] && [[ -z ${SCB_USER_DEST} ]]; then
+        scb_log "Invalid user name for backup user. Must have name in format backup-hostname."
+        exit 1
+    fi
+}
+
+scb_backup()
+{
+    scb_log "scbclient started."
+
+    scb_check_user
+
+    scb_check_remote
+
+    case ${?} in
+        10)
+            scb_log "User is not a valid backup user."
+            exit 1
+        ;;
+
+        20)
+            scb_log "Main backup directory does not exists."
+            exit 1
+        ;;
+
+        25)
+            scb_log "Could not create users backup directory."
+            exit 1
+        ;;
+
+        30)
+            scb_log "There is already a daily backup for today."
+            exit 1
+        ;;
+
+        31)
+            scb_log "There is already a weekly backup for today."
+            exit 1
+        ;;
+
+        32)
+            scb_log "There is already a monthly backup for today."
+            exit 1
+        ;;
+
+        40)
+            scb_log "Yesterdays backup was a daily one."
+            local _BACKUP_YESTERDAY_TYPE=daily
+        ;;
+
+        41)
+            scb_log "Yesterdays backup was a weekly one."
+            local _BACKUP_YESTERDAY_TYPE=weekly
+        ;;
+
+        42)
+            scb_log "Yesterdays backup was a monthly one."
+            local _BACKUP_YESTERDAY_TYPE=monthly
+        ;;
+
+        49)
+            scb_log "There is neither a backup for today nor one for yesterday."
+        ;;
+
+        99)
+            scb_log "Unknown error while running scbserver."
+            exit 1
+        ;;
+
+        *)
+            scb_log "Unknown error from scbserver."
+            exit 1
+        ;;
+
+    esac
+
+    # If there is an existing backup for today or if there was an error, the program was exited
+    # until here and we now just have to check for yesterdays backups.
+    if [[ -z ${_BACKUP_YESTERDAY_TYPE} ]]; then
+        # If there is no backup for yesterday and no backup for today, do a monthly one
+        scb_backup_monthly
+        local _BACKUP_TODAYDAY_TYPE=monthly
+
+    elif [[ "m" == ${_BACKUP_YESTERDAY_TYPE} ]] && [[ ${_today} -eq 1 ]]; then
+        # If yesterdays backup exists and is a monthly one and today is
+        # the 1st of the month, do a weekly backup.
+        scb_backup_weekly
+        local _BACKUP_TODAYDAY_TYPE=weekly
+
+    elif [[ ${_today} -eq 1 ]]; then
+        # Today is the 1st of the month, so do a monthly backup
+        scb_backup_monthly
+        local _BACKUP_TODAYDAY_TYPE=monthly
+
+    elif [[ ${_today} -eq 7 ]]; then
+        # Today is sunday, so let's do a weekly backup
+        scb_backup_weekly
+        local _BACKUP_TODAYDAY_TYPE=weekly
+
+    else
+        # In all other cases, do a daily backup
+        scb_backup_daily ${_BACKUP_YESTERDAY_TYPE}
+        local _BACKUP_TODAYDAY_TYPE=daily
+
+    fi
+
+    if [[ "y" == ${SCB_COMPRESS_MONTHLY} ]]; then
+        scb_compress_monthly
+    fi
+
+    if [[ "y" == ${SCB_MAIL_LOG} ]]; then
+        scb_mail ${_BACKUP_TODAYDAY_TYPE}
+    fi
+
+    rm ${SCB_LOG_FILE}
+    rm ${SCB_RSYNC_LOG_FILE}
+
+    logger "$(date '+%Y-%m-%d %T'): Finished."
+    echo "$(date '+%Y-%m-%d %T'): Finished."
+
+    exit 0
+}
+
+scb_backup
+
+unset SCB_SERVER
+unset SCB_PORT
+unset SCB_USER
+unset SCB_KEY
+unset SCB_DEST
+unset SCB_BACKUP_DIRS
+unset SCB_BACKUP_BOOT
+unset SCB_BOOT_TYPE
+unset SCB_BOOT_DEV
+unset SCB_BACKUP_LUKS
+unset SCB_LUKS_DEVS
+unset SCB_SNAPSHOT
+unset SCB_SNAPSHOT_NAME
+unset SCB_SNAPSHOT_VOL_GROUP
+unset SCB_SNAPSHOT_DEV
+unset SCB_SNAPSHOT_MOUNT_SRC
+unset SCB_SNAPSHOT_MOUNT_DEST
+unset SCB_BACKUP_MYSQL
+unset SCB_MYSQL_PASS
+unset SCB_COMPRESS_MONTHLY
+unset SCB_DELETE_AFTER_COMPRESSION
+unset SCB_MAIL_LOG
+unset SCB_MAIL_RECIPIENT
+unset SCB_SSH
+unset SCB_CAT
+unset SCB_LVCREATE
+unset SCB_LVREMOVE
+unset SCB_MOUNT
+unset SCB_UMOUNT
+unset SCB_MYSQL
+unset SCB_RSYNC
+unset SCB_MAIL
+unset SCB_MUTT
+unset SCB_LOG_FILE
+unset SCB_RSYNC_LOG_FILE
+unset SCB_SSH_CMD
+unset SCB_ROOT_DIR
+unset SCB_USER_DEST
+unset -f scb_log
+unset -f scb_check_remote
+unset -f scb_backup_boot
+unset -f scb_backup_luks
+unset -f scb_snapshot_create
+unset -f scb_snapshot_mount
+unset -f scb_snapshot_remove
+unset -f scb_compress_monthly
+unset -f scb_backup_monthly
+unset -f scb_backup_weekly
+unset -f scb_backup_daily
+unset -f scb_mail
+unset -f scb_check_user
+unset -f scb_backup

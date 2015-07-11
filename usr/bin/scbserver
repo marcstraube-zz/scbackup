@@ -1,0 +1,102 @@
+#!/bin/bash
+
+#
+# /usr/bin/scbserver
+#
+
+# Possible exit codes
+#
+# 10: User is not a valid backup user.
+# 20: Main backup directory does not exist.
+# 25: Could not create users backup directory.
+# 30: There is already a daily backup for today.
+# 31: There is already a weekly backup for today.
+# 32: There is already a monthly backup for today.
+# 40: Yesterdays backup was a daily one.
+# 41: Yesterdays backup was a weekly one.
+# 42: Yesterdays backup was a monthly one.
+# 49: There is neither a backup for today nor one for yesterday.
+# 99: Unknown error while running scbserver.
+
+# Source the configuration
+source /etc/scbackup/server.conf
+
+scb_checkdirs() {
+    local _userdir=$(whoami | cut -d '-' -f2)
+    local _userbackup=${BACKUP_DIR}/${_userdir}
+    local _today=$(date -I) 
+    local _yesterday=$(date -d "yesterday 13:00 " '+%Y-%m-%d')
+
+    # Check if user is a valid backup user
+    if [[ $(whoami | cut -d '-' -f1) != "backup" ]] || [[ -z $_userdir ]]; then
+        exit 10
+    fi
+
+    # Check if the main backup directory is available
+    if [[ ! -d ${BACKUP_DIR} ]]; then
+        exit 20
+    fi
+
+    # Create users main backup directory if it does not exist.
+    if [[ ! -d ${_userbackup} ]]; then
+        mkdir ${_userbackup} || exit 25
+    fi
+
+    # Check if there is already a backup for today and what kind of backup it is
+    if [[ -d ${_userbackup}/daily.${_today} ]]; then
+        exit 30
+
+    elif [[ -d ${_userbackup}/weekly.${_today} ]]; then
+        exit 31
+
+    elif [[ -d ${_userbackup}/monthly.${_today} ]]; then
+        exit 32
+
+    fi
+
+    # If there is no backup for today, check if we have one for yesterday and if,
+    #  what kind it is.
+    if [[ -d ${_userbackup}/daily.${_yesterday} ]]; then
+        exit 40
+
+    elif [[ -d ${_userbackup}/weekly.${_yesterday} ]]; then
+        exit 41
+
+    elif [[ -d ${_userbackup}/monthly.${_yesterday} ]]; then
+        exit 42
+
+    else
+        exit 49
+
+    fi
+
+    exit 99
+}
+
+scb_compress_monthly() {
+    local _bd=${BACKUP_DIR}/$(whoami | cut -d '-' -f2)
+    local _dn=${_bd}/monthly.$(date -I)
+
+    tar cf - ${_dn} | xz -9e -c - > ${_dn}.tar.xz || exit 1
+
+    if [[ "y" == ${1} ]]; then
+        logger "Delete origin."
+    fi
+
+    exit 0
+}
+
+scbserver() {
+    if [[ "checkdirs" == ${1} ]]; then
+        scb_checkdirs
+
+    elif [[ "compress" == ${1} ]]; then
+        scb_compress_monthly ${2}
+
+    fi
+
+}
+
+scbserver $1 $2
+
+unset SCB_BACKUP_DIR
