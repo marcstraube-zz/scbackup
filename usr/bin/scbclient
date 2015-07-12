@@ -157,7 +157,7 @@ scb_backup_weekly()
     for DIR in ${SCB_BACKUP_DIRS}; do
         scb_log "Starting rsync for directory ${DIR}."
 
-        ${SCB_RSYNC} -aAXvz --numeric-ids -e "${SCB_SSH_CMD}" ${DIR} ${SCB_USER}@${SCB_DEST}/${SCB_USER_DEST}/weekly.$(date -I) >> ${SCB_RSYNC_LOG_FILE}
+        ${SCB_RSYNC} -aAXvz --numeric-ids -e "${SCB_SSH_CMD}" ${DIR} ${SCB_USER}@:${SCB_SERVER}:${SCB_DEST}/${SCB_USER_DEST}/weekly.$(date -I) >> ${SCB_RSYNC_LOG_FILE}
     done
 
     if [[ "y" == ${SCB_SNAPSHOT} ]]; then
@@ -182,7 +182,7 @@ scb_backup_daily()
     for DIR in ${SCB_BACKUP_DIRS}; do
         scb_log "Starting rsync for directory ${DIR}."
 
-        ${SCB_RSYNC} -aAXvz --delete --numeric-ids -e "${SCB_SSH_CMD}" --link-dest=${_DIR_YESTERDAY} ${DIR} ${SCB_USER}@${SCB_DEST}/${SCB_USER_DEST}/daily.$(date -I) >> ${SCB_RSYNC_LOG_FILE}
+        ${SCB_RSYNC} -aAXvz --delete --numeric-ids -e "${SCB_SSH_CMD}" --link-dest=${_DIR_YESTERDAY} ${DIR} ${SCB_USER}@${SCB_SERVER}:${SCB_DEST}/${SCB_USER_DEST}/daily.$(date -I) >> ${SCB_RSYNC_LOG_FILE}
     done
 
     if [[ "y" == ${SCB_SNAPSHOT} ]]; then
@@ -291,37 +291,36 @@ scb_backup()
     if [[ -z ${_BACKUP_YESTERDAY_TYPE} ]]; then
         # If there is no backup for yesterday and no backup for today, do a monthly one
         scb_backup_monthly
-        local _BACKUP_TODAYDAY_TYPE=monthly
+        local _BACKUP_TODAY_TYPE=monthly
 
-    elif [[ "m" == ${_BACKUP_YESTERDAY_TYPE} ]] && [[ ${_today} -eq 1 ]]; then
-        # If yesterdays backup exists and is a monthly one and today is
-        # the 1st of the month, do a weekly backup.
+    elif [[ "monthly" == ${_BACKUP_YESTERDAY_TYPE} ]]; then
+        # If yesterdays backup exists and is a monthly one, a weekly one fits our needs.
         scb_backup_weekly
-        local _BACKUP_TODAYDAY_TYPE=weekly
+        local _BACKUP_TODAY_TYPE=weekly
 
     elif [[ ${_today} -eq 1 ]]; then
         # Today is the 1st of the month, so do a monthly backup
         scb_backup_monthly
-        local _BACKUP_TODAYDAY_TYPE=monthly
+        local _BACKUP_TODAY_TYPE=monthly
 
     elif [[ ${_today} -eq 7 ]]; then
         # Today is sunday, so let's do a weekly backup
         scb_backup_weekly
-        local _BACKUP_TODAYDAY_TYPE=weekly
+        local _BACKUP_TODAY_TYPE=weekly
 
     else
         # In all other cases, do a daily backup
         scb_backup_daily ${_BACKUP_YESTERDAY_TYPE}
-        local _BACKUP_TODAYDAY_TYPE=daily
+        local _BACKUP_TODAY_TYPE=daily
 
     fi
 
-    if [[ "y" == ${SCB_COMPRESS_MONTHLY} ]]; then
+    if [[ "monthly" == ${_BACKUP_TODAY_TYPE} ]] && [[ "y" == ${SCB_COMPRESS_MONTHLY} ]]; then
         scb_compress_monthly
     fi
 
     if [[ "y" == ${SCB_MAIL_LOG} ]]; then
-        scb_mail ${_BACKUP_TODAYDAY_TYPE}
+        scb_mail ${_BACKUP_TODAY_TYPE}
     fi
 
     rm ${SCB_LOG_FILE}
